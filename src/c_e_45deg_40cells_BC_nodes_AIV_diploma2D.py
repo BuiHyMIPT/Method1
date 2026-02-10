@@ -116,59 +116,127 @@ def monotonicity_violations(rho_ref: np.ndarray, rho_new: np.ndarray, tol: float
     return viol
 
 
+# def step_with_aiv(
+#     rho_old: np.ndarray,
+#     dt: float,
+#     beta_limiter: float = 0.8,
+#     const_rho: float = 0.10,
+#     omega: float = 0.50,
+#     relax_it: float = 0.50,
+#     max_iters: int = 200,
+#     eps_rel: float = 1e-8,
+#     eps_abs: float = 1e-12,
+# ):
+#     CFL = compute_cfl(dt)
+#     h = min(dx, dy)
+
+#     rho0 = rho_old.copy()
+#     apply_bc(rho0)
+
+#     # initial iterate rho^s
+#     rho_s = rho0.copy()
+
+#     # beta starts from CFL (depends on Courant number)
+#     beta = np.full_like(rho0, CFL)
+#     beta[0, :] = beta[-1, :] = beta[:, 0] = beta[:, -1] = 0.0
+
+#     for _ in range(max_iters):
+#         rho_inter = omega * rho_s + (1.0 - omega) * rho0
+#         nu = beta * (h * h) / dt
+
+#         rho_new = step_once_interpolated(rho0, rho_inter, dt, nu)
+
+#         # check oscillations -> update beta
+#         viol = monotonicity_violations(rho0, rho_new)
+#         if np.any(viol):
+#             inc = const_rho * CFL
+#             idx = np.argwhere(viol)
+#             for i, j in idx:
+#                 # update beta at node and 4-neighbors
+#                 for di, dj in [(0,0), (-1,0), (1,0), (0,-1), (0,1)]:
+#                     ii, jj = i + di, j + dj
+#                     if 0 <= ii < nx and 0 <= jj < ny:
+#                         beta[ii, jj] = min(beta_limiter, beta[ii, jj] + inc)
+
+#         # # relaxation update (convergence control)
+#         rho_s_next = relax_it * rho_new + (1.0 - relax_it) * rho_s
+#         apply_bc(rho_s_next)
+
+#         diff = float(np.max(np.abs(rho_s_next - rho_s)))
+#         thresh = float(eps_rel * np.max(np.abs(rho_s_next)) + eps_abs)
+
+#         rho_s = rho_s_next
+#         if (diff < thresh) and (not np.any(viol)):
+#             break
+
+#     return rho_s, beta
+
+
 def step_with_aiv(
     rho_old: np.ndarray,
     dt: float,
-    beta_limiter: float = 0.8,
-    const_rho: float = 0.10,
-    omega: float = 0.30,
-    max_iters: int = 200,
-    eps_rel: float = 1e-8,
+    omega: float = 0.50,          # вес временной интерполяции
+    const_rho: float = 0.10,      # добавка к beta при осцилляциях
+    beta_limiter: float = 0.80,
+    max_outer_iters: int = 50,    # итерации до сходимости
+    max_inner_iters: int = 200,   # подбор beta
+    eps_rel: float = 1e-10,
     eps_abs: float = 1e-12,
 ):
-    CFL = compute_cfl(dt)
+    CFL_local = compute_cfl(dt)
     h = min(dx, dy)
 
     rho0 = rho_old.copy()
     apply_bc(rho0)
 
-    # initial iterate rho^s
     rho_s = rho0.copy()
 
-    # beta starts from CFL (depends on Courant number)
-    beta = np.full_like(rho0, CFL)
+    beta = np.full_like(rho0, CFL_local)
     beta[0, :] = beta[-1, :] = beta[:, 0] = beta[:, -1] = 0.0
 
-    for _ in range(max_iters):
-        rho_inter = 0.5 * (rho_s + rho0)
-        nu = beta * (h * h) / dt
+    last_inner_viol = False
 
-        rho_new = step_once_interpolated(rho0, rho_inter, dt, nu)
+    for _s in range(max_outer_iters):
+        rho_inter = omega * rho_s + (1.0 - omega) * rho0
 
-        # check oscillations -> update beta
-        viol = monotonicity_violations(rho0, rho_new)
-        if np.any(viol):
-            inc = const_rho * CFL
+        #цикл по beta
+        rho_new = None
+        last_inner_viol = False
+        for _k in range(max_inner_iters):
+            nu = beta * (h * h) / dt
+            rho_new = step_once_interpolated(rho0, rho_inter, dt, nu)
+
+            viol = monotonicity_violations(rho0, rho_new)
+            if not np.any(viol):
+                last_inner_viol = False
+                break
+
+            last_inner_viol = True
+            inc = const_rho * CFL_local
+            updated = False
+
             idx = np.argwhere(viol)
             for i, j in idx:
-                # update beta at node and 4-neighbors
-                for di, dj in [(0,0), (-1,0), (1,0), (0,-1), (0,1)]:
-                    ii, jj = i + di, j + dj
-                    if 0 <= ii < nx and 0 <= jj < ny:
-                        beta[ii, jj] = min(beta_limiter, beta[ii, jj] + inc)
+                for di in (0, 1):
+                    for dj in (0, 1):
+                        ii, jj = i + di, j + dj
+                        if 0 <= ii < nx and 0 <= jj < ny:
+                            if beta[ii, jj] < beta_limiter:
+                                beta[ii, jj] = min(beta_limiter, beta[ii, jj] + inc)
+                                updated = True
 
-        # relaxation update (convergence control)
-        rho_s_next = omega * rho_new + (1.0 - omega) * rho_s
-        apply_bc(rho_s_next)
+            if not updated:
+                break
 
-        diff = float(np.max(np.abs(rho_s_next - rho_s)))
-        thresh = float(eps_rel * np.max(np.abs(rho_s_next)) + eps_abs)
+        diff = float(np.max(np.abs(rho_new - rho_s)))
+        thresh = float(eps_rel * np.max(np.abs(rho_new)) + eps_abs)
 
-        rho_s = rho_s_next
-        if (diff < thresh) and (not np.any(viol)):
+        rho_s = rho_new
+        if diff < thresh and (not last_inner_viol):
             break
 
     return rho_s, beta
+
 
 
 def run_sim(use_aiv: bool, T_end: float = 0.8, dt: float = 0.004, beta_limiter: float = 0.8):
