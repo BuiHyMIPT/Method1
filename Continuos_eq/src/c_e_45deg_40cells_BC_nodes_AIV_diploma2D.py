@@ -176,7 +176,8 @@ def step_with_aiv(
     rho_old: np.ndarray,
     dt: float,
     omega: float = 0.50,          # вес временной интерполяции
-    const_rho: float = 0.10,      # добавка к beta при осцилляциях
+    # const_rho: float = 0.10,      # добавка к beta при осцилляциях
+    const_rho: float = 0.02,
     beta_limiter: float = 0.80,
     max_outer_iters: int = 50,    # итерации до сходимости
     max_inner_iters: int = 200,   # подбор beta
@@ -256,9 +257,25 @@ def run_sim(use_aiv: bool, T_end: float = 0.8, dt: float = 0.004, beta_limiter: 
 
     return rho, beta_last
 
+
+import time
+
+t0 = time.perf_counter()
+rho_no, _ = run_sim(use_aiv=False, T_end=0.8, dt=dt, beta_limiter=0.3)
+t1 = time.perf_counter()
+print(f"No AIV time: {t1 - t0:.6f} s")
+
+t2 = time.perf_counter()
+rho_aiv, beta_last = run_sim(use_aiv=True,  T_end=0.8, dt=dt, beta_limiter=0.3)
+t3 = time.perf_counter()
+print(f"With AIV time: {t3 - t2:.6f} s")
+
+print(f"Время выполнения (total): {t3 - t0:.6f} s")
+
+
 # Simulate
-rho_no, _ = run_sim(use_aiv=False, T_end=0.8, dt=dt, beta_limiter=0.8)
-rho_aiv, beta_last = run_sim(use_aiv=True,  T_end=0.8, dt=dt, beta_limiter=0.8)
+# rho_no, _ = run_sim(use_aiv=False, T_end=0.8, dt=dt, beta_limiter=0.8)
+# rho_aiv, beta_last = run_sim(use_aiv=True,  T_end=0.8, dt=dt, beta_limiter=0.8)
 print(f"No AIV: rho min/max = {rho_no.min():.6f} / {rho_no.max():.6f}")
 print(f"With AIV: rho min/max = {rho_aiv.min():.6f} / {rho_aiv.max():.6f}; beta_last max={beta_last.max():.3f}")
 
@@ -288,7 +305,7 @@ ax[1].set_xlabel("x"); ax[1].set_ylabel("y")
 cbar1 = fig.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
 cbar1.set_label("Плотность ρ")
 
-plt.suptitle("Density field ρ(x,y) — grid 40×40 cells, angle 45°")
+plt.suptitle("Density field ρ(x,y) — grid 40×40 cells")
 plt.show()
 
 from mpl_toolkits.mplot3d import Axes3D
