@@ -4,9 +4,9 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from pathlib import Path
 import time
 
-# -----------------------------
+# ============================================================
 # Parameters
-# -----------------------------
+# ============================================================
 gamma = 5.0 / 3.0   # or 1.0
 # gamma = 1.0
 cSound = 1.0
@@ -18,26 +18,28 @@ nx_cells, ny_cells = 80, 80
 x_min, x_max = -1.0, 1.0
 y_min, y_max = 0.0, 1.0
 
+
+
 dt = 0.001
 T_end = 0.30
 
 # AIV parameters
-beta_limiter = 0.18
-const_rho = 0.005
-const_u = 0.005
+beta_limiter = 0.30
+const_rho = 0.01
+const_u = 0.01
 
 omega_time = 0.50
-max_outer_iters = 15
-max_inner_iters = 60
+max_outer_iters = 20   # convergence of coupled iterate
+max_inner_iters = 60   # monotonicity / beta-selection loop
 eps_rel = 1e-10
 eps_abs = 1e-12
 
 OUTDIR = Path("outputs")
 OUTDIR.mkdir(exist_ok=True)
 
-# -----------------------------
+# ============================================================
 # Initial / boundary data
-# -----------------------------
+# ============================================================
 rho_L = (P_L / cSound) ** (1.0 / gamma)
 den = (1.0 / rho_R - 1.0 / rho_L)
 if den <= 0.0:
@@ -50,15 +52,20 @@ u_R = 0.0
 v_L = 0.0
 v_R = 0.0
 
-# -----------------------------
+# ============================================================
 # Grid / geometry
-# -----------------------------
+# ============================================================
 nx, ny = nx_cells + 1, ny_cells + 1
 x = np.linspace(x_min, x_max, nx)
 y = np.linspace(y_min, y_max, ny)
 dx = (x_max - x_min) / nx_cells
 dy = (y_max - y_min) / ny_cells
 X, Y = np.meshgrid(x, y, indexing="ij")
+
+print(f"Cells grid = {nx_cells}x{ny_cells}")
+# print(f"Nodes grid = {nx}x{ny}")
+# print(f"dx = {dx:.6f}, dy = {dy:.6f}")
+
 
 Lx = np.full((nx, ny), dx)
 Ly = np.full((nx, ny), dy)
@@ -69,12 +76,12 @@ Ly[:, -1] *= 0.5
 V = Lx * Ly
 h = min(dx, dy)
 
-# -----------------------------
+# ============================================================
 # Helpers
-# -----------------------------
+# ============================================================
 def pressure_from_rho(rho: np.ndarray) -> np.ndarray:
-    # return cSound * rho**gamma
-    return (cSound ** 2) * rho
+    return cSound * rho**gamma
+    # return rho * cSound ** 2 
 
 def apply_bc(rho: np.ndarray, u: np.ndarray, v: np.ndarray) -> None:
     rho[:, 0]  = rho[:, 1]
@@ -127,9 +134,9 @@ def exact_fields(t: float):
     v_ex   = np.zeros_like(rho_ex)
     return rho_ex, u_ex, v_ex, xf
 
-# -----------------------------
-# Fluxes
-# -----------------------------
+# ============================================================
+# Fluxes and operators
+# ============================================================
 def compute_mass_fluxes(rho: np.ndarray, u: np.ndarray, v: np.ndarray, nu_rho: np.ndarray):
     F = np.zeros((nx + 1, ny))
     G = np.zeros((nx, ny + 1))
@@ -157,9 +164,9 @@ def compute_regularized_pressure(rho: np.ndarray, u: np.ndarray, v: np.ndarray, 
     F0, G0 = compute_mass_fluxes(rho, u, v, np.zeros_like(rho))
     return P - nu_u * compute_div(F0, G0)
 
-# -----------------------------
+# ============================================================
 # Monotonicity / AIV
-# -----------------------------
+# ============================================================
 def monotonicity_violations(ref: np.ndarray, cand: np.ndarray, tol: float = 1e-12) -> np.ndarray:
     a = ref
     blocks = (
@@ -183,88 +190,50 @@ def dilate_cross(mask: np.ndarray) -> np.ndarray:
     dil[:, 1:]  |= mask[:, :-1]
     return dil
 
-def increase_beta(beta: np.ndarray, viol: np.ndarray, kr: np.ndarray, const_val: float, limiter: float):
+# def smooth_beta(beta: np.ndarray) -> np.ndarray:
+#     out = beta.copy()
+#     out[1:-1, 1:-1] = (
+#         4.0 * beta[1:-1, 1:-1]
+#         + beta[:-2, 1:-1] + beta[2:, 1:-1]
+#         + beta[1:-1, :-2] + beta[1:-1, 2:]
+#     ) / 8.0
+#     return out
+
+def increase_beta_local(beta: np.ndarray, viol: np.ndarray, kr: np.ndarray, const_val: float, limiter: float):
+    """
+        beta_new = beta_old + const * k_r
+    """
     if not np.any(viol):
         return beta, False
-    # area = dilate_cross(viol)
-    beta_new = np.minimum(limiter, beta + const_val * kr)
-    updated = np.any(beta_new > beta)
+
+    area = dilate_cross(dilate_cross(viol))
+    beta_new = beta.copy()
+    beta_new[area] = np.minimum(limiter, beta_new[area] + const_val * kr[area])
+
+    # a very mild smoothing of beta itself
+    # beta_new = smooth_beta(beta_new)
+    beta_new = np.minimum(limiter, np.maximum(beta_new, 0.0))
+
+    updated = np.any(beta_new > beta + 1e-15)
     return beta_new, updated
 
-# -----------------------------
-# Density step
-# -----------------------------
-def step_density_no_aiv(rho_old: np.ndarray, u: np.ndarray, v: np.ndarray):
+# ============================================================
+# One explicit time step without AIV
+# ============================================================
+def step_no_aiv(rho_old: np.ndarray, u_old: np.ndarray, v_old: np.ndarray):
     rho0 = rho_old.copy()
-    u0 = u.copy()
-    v0 = v.copy()
-    apply_bc(rho0, u0, v0)
-
-    F, G = compute_mass_fluxes(rho0, u0, v0, np.zeros_like(rho0))
-    rho_new = (rho0 * V - dt * compute_div_integral(F, G)) / V
-    apply_bc(rho_new, u0, v0)
-    return rho_new
-
-def step_density_with_aiv(rho_old: np.ndarray, u: np.ndarray, v: np.ndarray):
-    rho0 = rho_old.copy()
-    u0 = u.copy()
-    v0 = v.copy()
-    apply_bc(rho0, u0, v0)
-
-    kr = local_cfl_field(u0, v0)
-    # beta = np.zeros_like(rho0)
-    beta_rho = np.full_like(rho0, 0.1 * kr)
-
-    rho_s = rho0.copy()
-
-    beta_last = beta_rho.copy()
-    last_inner_viol = False
-
-    for _ in range(max_outer_iters):
-        rho_inter = omega_time * rho_s + (1.0 - omega_time) * rho0
-        rho_new = rho_s.copy()
-        beta_work = beta_rho.copy()
-        last_inner_viol = False
-
-        for _ in range(max_inner_iters):
-            nu = beta_work * h * h / dt
-            F, G = compute_mass_fluxes(rho_inter, u0, v0, nu)
-            rho_new = (rho0 * V - dt * compute_div_integral(F, G)) / V
-            apply_bc(rho_new, u0, v0)
-
-            viol = monotonicity_violations(rho0, rho_new)
-            if not np.any(viol):
-                beta_rho = beta_work.copy()
-                last_inner_viol = False
-                break
-
-            last_inner_viol = True
-            beta_work, updated = increase_beta(beta_work, viol, kr, const_rho, beta_limiter)
-            beta_rho = beta_work.copy()
-            if not updated:
-                break
-
-        beta_last = beta_rho.copy()
-        diff = float(np.max(np.abs(rho_new - rho_s)))
-        thresh = float(eps_rel * np.max(np.abs(rho_new)) + eps_abs)
-        rho_s = rho_new
-        if diff < thresh and (not last_inner_viol):
-            break
-
-    return rho_s, beta_last
-
-# -----------------------------
-# Velocity step
-# -----------------------------
-def step_velocity_no_aiv(rho: np.ndarray, u_old: np.ndarray, v_old: np.ndarray):
-    rho0 = rho.copy()
     u0 = u_old.copy()
     v0 = v_old.copy()
     apply_bc(rho0, u0, v0)
 
+    # equation 1
     F, G = compute_mass_fluxes(rho0, u0, v0, np.zeros_like(rho0))
+    rho_new = (rho0 * V - dt * compute_div_integral(F, G)) / V
+    apply_bc(rho_new, u0, v0)
 
-    pi = pressure_from_rho(rho0)
+    # equation 2
+    F, G = compute_mass_fluxes(rho_new, u0, v0, np.zeros_like(rho_new))
+    pi = pressure_from_rho(rho_new)
     pi_x = node_to_xface(pi)
     pi_y = node_to_yface(pi)
 
@@ -279,46 +248,64 @@ def step_velocity_no_aiv(rho: np.ndarray, u_old: np.ndarray, v_old: np.ndarray):
     conv_x_int = compute_div_integral(F * u_x, G * u_y)
     conv_y_int = compute_div_integral(F * v_x, G * v_y)
 
-    m = rho0 * V
+    m = rho_new * V
     mx = (rho0 * u0) * V
     my = (rho0 * v0) * V
 
     u_new = (mx - dt * (press_x_int + conv_x_int)) / m
     v_new = (my - dt * (press_y_int + conv_y_int)) / m
-    apply_bc(rho0, u_new, v_new)
-    return u_new, v_new
+    apply_bc(rho_new, u_new, v_new)
 
-def step_velocity_with_aiv(rho: np.ndarray, u_old: np.ndarray, v_old: np.ndarray, beta_rho: np.ndarray):
-    rho0 = rho.copy()
+    return rho_new, u_new, v_new
+
+# ============================================================
+# Joint AIV step:
+# ============================================================
+def step_joint_with_aiv(rho_old: np.ndarray, u_old: np.ndarray, v_old: np.ndarray):
+    rho0 = rho_old.copy()
     u0 = u_old.copy()
     v0 = v_old.copy()
     apply_bc(rho0, u0, v0)
 
-    kr = local_cfl_field(u0, v0)
-    # beta_u = np.zeros_like(u0)
-    beta_u = np.full_like(rho0, 0.1 * kr)
+    beta_rho = np.zeros_like(rho0)
+    beta_u   = np.zeros_like(u0)
 
+    rho_s = rho0.copy()
     u_s = u0.copy()
     v_s = v0.copy()
-    beta_last = beta_u.copy()
-    last_inner_viol = False
 
-    for _ in range(max_outer_iters):
-        u_inter = omega_time * u_s + (1.0 - omega_time) * u0
-        v_inter = omega_time * v_s + (1.0 - omega_time) * v0
+    beta_rho_last = beta_rho.copy()
+    beta_u_last = beta_u.copy()
 
+    for _s in range(max_outer_iters):
+        rho_inter = omega_time * rho_s + (1.0 - omega_time) * rho0
+        u_inter   = omega_time * u_s   + (1.0 - omega_time) * u0
+        v_inter   = omega_time * v_s   + (1.0 - omega_time) * v0
+        apply_bc(rho_inter, u_inter, v_inter)
+
+        beta_rho_work = beta_rho.copy()
+        beta_u_work   = beta_u.copy()
+
+        rho_new = rho_s.copy()
         u_new = u_s.copy()
         v_new = v_s.copy()
-        beta_work = beta_u.copy()
+
         last_inner_viol = False
 
-        for _ in range(max_inner_iters):
-            nu_rho = beta_rho * h * h / dt
-            nu_u = beta_work * h * h / dt
+        for _k in range(max_inner_iters):
+            kr = local_cfl_field(u_inter, v_inter)
 
-            F, G = compute_mass_fluxes(rho0, u_inter, v_inter, nu_rho)
+            # ----- equation 1: continuity
+            nu_rho = beta_rho_work * h * h / dt
+            F_rho, G_rho = compute_mass_fluxes(rho_inter, u_inter, v_inter, nu_rho)
+            rho_new = (rho0 * V - dt * compute_div_integral(F_rho, G_rho)) / V
+            apply_bc(rho_new, u_inter, v_inter)
 
-            pi = compute_regularized_pressure(rho0, u_inter, v_inter, nu_u)
+            # ----- equation 2: momentum
+            F_m, G_m = compute_mass_fluxes(rho_new, u_inter, v_inter, nu_rho)
+
+            nu_u = beta_u_work * h * h / dt
+            pi = compute_regularized_pressure(rho_new, u_inter, v_inter, nu_u)
             pi_x = node_to_xface(pi)
             pi_y = node_to_yface(pi)
 
@@ -330,45 +317,76 @@ def step_velocity_with_aiv(rho: np.ndarray, u_old: np.ndarray, v_old: np.ndarray
             u_y = node_to_yface(u_inter)
             v_y = node_to_yface(v_inter)
 
-            conv_x_int = compute_div_integral(F * u_x, G * u_y)
-            conv_y_int = compute_div_integral(F * v_x, G * v_y)
+            conv_x_int = compute_div_integral(F_m * u_x, G_m * u_y)
+            conv_y_int = compute_div_integral(F_m * v_x, G_m * v_y)
 
-            m = rho0 * V
+            m = rho_new * V
             mx = (rho0 * u0) * V
             my = (rho0 * v0) * V
 
             u_new = (mx - dt * (press_x_int + conv_x_int)) / m
             v_new = (my - dt * (press_y_int + conv_y_int)) / m
-            apply_bc(rho0, u_new, v_new)
+            apply_bc(rho_new, u_new, v_new)
 
-            viol_u = monotonicity_violations(u0, u_new)
-            viol_v = monotonicity_violations(v0, v_new)
-            viol = viol_u | viol_v
+            viol_rho = monotonicity_violations(rho0, rho_new)
+            viol_u   = monotonicity_violations(u0, u_new)
+            viol_v   = monotonicity_violations(v0, v_new)
+            viol_mom = viol_u | viol_v
 
-            if not np.any(viol):
-                beta_u = beta_work.copy()
+            if (not np.any(viol_rho)) and (not np.any(viol_mom)):
                 last_inner_viol = False
                 break
 
             last_inner_viol = True
-            beta_work, updated = increase_beta(beta_work, viol, kr, const_u, beta_limiter)
-            beta_u = beta_work.copy()
-            if not updated:
+            updated_any = False
+
+            if np.any(viol_rho):
+                beta_rho_work, upd_rho = increase_beta_local(
+                    beta_rho_work, viol_rho, kr, const_rho, beta_limiter
+                )
+                updated_any = updated_any or upd_rho
+
+            if np.any(viol_mom):
+                beta_u_work, upd_u = increase_beta_local(
+                    beta_u_work, viol_mom, kr, const_u, beta_limiter
+                )
+                updated_any = updated_any or upd_u
+
+            if not updated_any:
                 break
 
-        beta_last = beta_u.copy()
-        diff = float(max(np.max(np.abs(u_new - u_s)), np.max(np.abs(v_new - v_s))))
-        thresh = float(eps_rel * max(np.max(np.abs(u_new)), np.max(np.abs(v_new))) + eps_abs)
+        # accept the beta values from the inner loop
+        beta_rho = beta_rho_work.copy()
+        beta_u = beta_u_work.copy()
+        beta_rho_last = beta_rho.copy()
+        beta_u_last = beta_u.copy()
+
+        # convergence of the WHOLE coupled iterate
+        diff = max(
+            float(np.max(np.abs(rho_new - rho_s))),
+            float(np.max(np.abs(u_new - u_s))),
+            float(np.max(np.abs(v_new - v_s))),
+        )
+        scale = max(
+            float(np.max(np.abs(rho_new))),
+            float(np.max(np.abs(u_new))),
+            float(np.max(np.abs(v_new))),
+            1.0
+        )
+        thresh = eps_rel * scale + eps_abs
+
+        rho_s = rho_new
         u_s = u_new
         v_s = v_new
+
         if diff < thresh and (not last_inner_viol):
             break
 
-    return u_s, v_s, beta_last
+    return rho_s, u_s, v_s, beta_rho_last, beta_u_last
 
-# -----------------------------
+# ============================================================
 # Simulation
-# -----------------------------
+# ============================================================
 def initial_fields():
     rho = np.where(X < 0.0, rho_L, rho_R).astype(float)
     u = np.where(X < 0.0, u_L, u_R).astype(float)
@@ -385,17 +403,15 @@ def run_sim(use_aiv: bool):
 
     for _ in range(nsteps):
         if use_aiv:
-            rho, beta_rho_last = step_density_with_aiv(rho, u, v)
-            u, v, beta_u_last = step_velocity_with_aiv(rho, u, v, beta_rho_last)
+            rho, u, v, beta_rho_last, beta_u_last = step_joint_with_aiv(rho, u, v)
         else:
-            rho = step_density_no_aiv(rho, u, v)
-            u, v = step_velocity_no_aiv(rho, u, v)
+            rho, u, v = step_no_aiv(rho, u, v)
 
     return rho, u, v, beta_rho_last, beta_u_last
 
-# -----------------------------
+# ============================================================
 # Plotting
-# -----------------------------
+# ============================================================
 def plot_2d3d(field_no, field_aiv, field_exact, title_main, short_label, out_png, xf):
     vmin = float(min(field_no.min(), field_aiv.min(), field_exact.min()))
     vmax = float(max(field_no.max(), field_aiv.max(), field_exact.max()))
@@ -455,6 +471,9 @@ def plot_centerline_compare(x, num_no, num_aiv, exact, ylabel, out_png, xf):
     plt.savefig(out_png, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
+# ============================================================
+# Main
+# ============================================================
 if __name__ == "__main__":
     t0 = time.perf_counter()
     rho_no, u_no, v_no, _, _ = run_sim(use_aiv=False)
@@ -465,7 +484,6 @@ if __name__ == "__main__":
     rho_aiv, u_aiv, v_aiv, beta_rho_last, beta_u_last = run_sim(use_aiv=True)
     t3 = time.perf_counter()
     print(f"With AIV time: {t3 - t2:.6f} s")
-
     print(f"Время выполнения (total): {t3 - t0:.6f} s")
 
     rho_ex, u_ex, v_ex, xf = exact_fields(T_end)
@@ -475,20 +493,21 @@ if __name__ == "__main__":
     print(f"No AIV : rho min/max = {rho_no.min():.6f} / {rho_no.max():.6f}; "
           f"u min/max = {u_no.min():.6f} / {u_no.max():.6f}; "
           f"CFL={compute_cfl(dt, u_no, v_no):.6f}")
-    
 
     print(f"With AIV: rho min/max = {rho_aiv.min():.6f} / {rho_aiv.max():.6f}; "
           f"u min/max = {u_aiv.min():.6f} / {u_aiv.max():.6f}; "
           f"beta_rho_max={beta_rho_last.max():.6f}; beta_u_max={beta_u_last.max():.6f}; "
           f"CFL={compute_cfl(dt, u_aiv, v_aiv):.6f}")
 
-    plot_2d3d(rho_no, rho_aiv, rho_ex, "Density field rho(x,y)", "rho", OUTDIR / "rho_coupled_with_exact_front.png", xf)
-    plot_2d3d(u_no, u_aiv, u_ex, "Velocity field u(x,y)", "u", OUTDIR / "u_coupled_with_exact_front.png", xf)
+    plot_2d3d(rho_no, rho_aiv, rho_ex, "Density field rho(x,y)",
+              "rho", OUTDIR / "rho_with_exact_front.png", xf)
+    plot_2d3d(u_no, u_aiv, u_ex, "Velocity field u(x,y)",
+              "u", OUTDIR / "u_with_exact_front.png", xf)
 
     plot_centerline_compare(x, rho_no[:, jmid], rho_aiv[:, jmid], rho_ex[:, jmid],
-                            "rho", OUTDIR / "rho_centerline_exact.png", xf)
+                            "rho", OUTDIR / "rho_centerline.png", xf)
     plot_centerline_compare(x, u_no[:, jmid], u_aiv[:, jmid], u_ex[:, jmid],
-                            "u", OUTDIR / "u_centerline_exact.png", xf)
+                            "u", OUTDIR / "u_centerline.png", xf)
 
     fig, ax = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
     im1 = ax[0].imshow(beta_rho_last.T, origin="lower", extent=[x_min, x_max, y_min, y_max], aspect="auto")
@@ -500,7 +519,7 @@ if __name__ == "__main__":
     ax[1].set_title("beta_u")
     ax[1].set_xlabel("x"); ax[1].set_ylabel("y")
     fig.colorbar(im2, ax=ax[1], fraction=0.046, pad=0.04)
-    plt.savefig(OUTDIR / "beta_coupled_with_exact_front.png", dpi=200, bbox_inches="tight")
+    plt.savefig(OUTDIR / "beta_with_exact_front.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     print(f"Saved outputs to: {OUTDIR.resolve()}")

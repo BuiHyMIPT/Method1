@@ -1,0 +1,7 @@
+Cells grid = 80x80
+No AIV time: 0.098271 s
+With AIV time: 276.429196 s
+Время выполнения (total): 276.527490 s
+D = 1.714366, front position x = D*T_end = 0.514310
+No AIV : rho min/max = 1.000000 / 1.853753; u min/max = 0.000000 / 0.884506; CFL=0.035380
+With AIV: rho min/max = 1.000000 / 1.520263; u min/max = 0.000000 / 0.598600; beta_rho_max=0.287344; beta_u_max=0.287344; CFL=0.023945
