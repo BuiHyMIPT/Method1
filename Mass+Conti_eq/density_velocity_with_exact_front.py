@@ -24,7 +24,8 @@ dt = 0.001
 T_end = 0.30
 
 # AIV parameters
-beta_limiter = 0.30
+beta_limiter = 0.50
+beta_limiter_u = 0.50
 const_rho = 0.01
 const_u = 0.01
 
@@ -159,10 +160,28 @@ def compute_div_integral(F: np.ndarray, G: np.ndarray) -> np.ndarray:
 def compute_div(F: np.ndarray, G: np.ndarray) -> np.ndarray:
     return compute_div_integral(F, G) / V
 
-def compute_regularized_pressure(rho: np.ndarray, u: np.ndarray, v: np.ndarray, nu_u: np.ndarray) -> np.ndarray:
-    P = pressure_from_rho(rho)
+def build_pressure_faces(rho: np.ndarray):
+    """
+    Thermodynamic pressure averaged to faces.
+    """
+    P_node = pressure_from_rho(rho)
+    P_x = node_to_xface(P_node)
+    P_y = node_to_yface(P_node)
+    return P_x, P_y
+
+def build_regularized_pressure_faces(rho: np.ndarray, u: np.ndarray, v: np.ndarray, nu_u: np.ndarray):
+    """
+    Regularized pressure on faces:
+        \tilde\pi = P^(0.5) - \nu_u DIV(\rho u)
+    """
+    P_x, P_y = build_pressure_faces(rho)
     F0, G0 = compute_mass_fluxes(rho, u, v, np.zeros_like(rho))
-    return P - nu_u * compute_div(F0, G0)
+    visc_corr_node = nu_u * compute_div(F0, G0)
+    visc_x = node_to_xface(visc_corr_node)
+    visc_y = node_to_yface(visc_corr_node)
+    pi_x = P_x - visc_x
+    pi_y = P_y - visc_y
+    return pi_x, pi_y
 
 # ============================================================
 # Monotonicity / AIV
@@ -190,15 +209,6 @@ def dilate_cross(mask: np.ndarray) -> np.ndarray:
     dil[:, 1:]  |= mask[:, :-1]
     return dil
 
-# def smooth_beta(beta: np.ndarray) -> np.ndarray:
-#     out = beta.copy()
-#     out[1:-1, 1:-1] = (
-#         4.0 * beta[1:-1, 1:-1]
-#         + beta[:-2, 1:-1] + beta[2:, 1:-1]
-#         + beta[1:-1, :-2] + beta[1:-1, 2:]
-#     ) / 8.0
-#     return out
-
 def increase_beta_local(beta: np.ndarray, viol: np.ndarray, kr: np.ndarray, const_val: float, limiter: float):
     """
         beta_new = beta_old + const * k_r
@@ -210,8 +220,6 @@ def increase_beta_local(beta: np.ndarray, viol: np.ndarray, kr: np.ndarray, cons
     beta_new = beta.copy()
     beta_new[area] = np.minimum(limiter, beta_new[area] + const_val * kr[area])
 
-    # a very mild smoothing of beta itself
-    # beta_new = smooth_beta(beta_new)
     beta_new = np.minimum(limiter, np.maximum(beta_new, 0.0))
 
     updated = np.any(beta_new > beta + 1e-15)
@@ -233,12 +241,10 @@ def step_no_aiv(rho_old: np.ndarray, u_old: np.ndarray, v_old: np.ndarray):
 
     # equation 2
     F, G = compute_mass_fluxes(rho_new, u0, v0, np.zeros_like(rho_new))
-    pi = pressure_from_rho(rho_new)
-    pi_x = node_to_xface(pi)
-    pi_y = node_to_yface(pi)
+    P_x, P_y = build_pressure_faces(rho_new)
 
-    press_x_int = (pi_x[1:nx+1, :] - pi_x[0:nx, :]) * Ly
-    press_y_int = (pi_y[:, 1:ny+1] - pi_y[:, 0:ny]) * Lx
+    press_x_int = (P_x[1:nx+1, :] - P_x[0:nx, :]) * Ly
+    press_y_int = (P_y[:, 1:ny+1] - P_y[:, 0:ny]) * Lx
 
     u_x = node_to_xface(u0)
     v_x = node_to_xface(v0)
@@ -259,7 +265,7 @@ def step_no_aiv(rho_old: np.ndarray, u_old: np.ndarray, v_old: np.ndarray):
     return rho_new, u_new, v_new
 
 # ============================================================
-# Joint AIV step:
+# Joint AIV step
 # ============================================================
 def step_joint_with_aiv(rho_old: np.ndarray, u_old: np.ndarray, v_old: np.ndarray):
     rho0 = rho_old.copy()
@@ -305,9 +311,7 @@ def step_joint_with_aiv(rho_old: np.ndarray, u_old: np.ndarray, v_old: np.ndarra
             F_m, G_m = compute_mass_fluxes(rho_new, u_inter, v_inter, nu_rho)
 
             nu_u = beta_u_work * h * h / dt
-            pi = compute_regularized_pressure(rho_new, u_inter, v_inter, nu_u)
-            pi_x = node_to_xface(pi)
-            pi_y = node_to_yface(pi)
+            pi_x, pi_y = build_regularized_pressure_faces(rho_new, u_inter, v_inter, nu_u)
 
             press_x_int = (pi_x[1:nx+1, :] - pi_x[0:nx, :]) * Ly
             press_y_int = (pi_y[:, 1:ny+1] - pi_y[:, 0:ny]) * Lx
@@ -347,8 +351,13 @@ def step_joint_with_aiv(rho_old: np.ndarray, u_old: np.ndarray, v_old: np.ndarra
                 updated_any = updated_any or upd_rho
 
             if np.any(viol_mom):
+                if not np.any(beta_u_work):
+                    beta_u_seed = beta_rho_work.copy()
+                else:
+                    beta_u_seed = beta_u_work.copy()
+
                 beta_u_work, upd_u = increase_beta_local(
-                    beta_u_work, viol_mom, kr, const_u, beta_limiter
+                    beta_u_seed, viol_mom, kr, const_u, beta_limiter_u
                 )
                 updated_any = updated_any or upd_u
 
