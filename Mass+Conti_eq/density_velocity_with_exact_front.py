@@ -24,14 +24,14 @@ dt = 0.001
 T_end = 0.30
 
 # AIV parameters
-beta_limiter = 0.50
-beta_limiter_u = 0.50
-const_rho = 0.01
-const_u = 0.01
+beta_limiter = 0.2
+beta_limiter_u = 0.3
+const_rho = 0.005
+const_u = 0.005
 
 omega_time = 0.50
 max_outer_iters = 20   # convergence of coupled iterate
-max_inner_iters = 60   # monotonicity / beta-selection loop
+max_inner_iters = 80   # monotonicity / beta-selection loop
 eps_rel = 1e-10
 eps_abs = 1e-12
 
@@ -82,7 +82,7 @@ h = min(dx, dy)
 # ============================================================
 def pressure_from_rho(rho: np.ndarray) -> np.ndarray:
     return cSound * rho**gamma
-    # return rho * cSound ** 2 
+    # return rho * cSound ** 2
 
 def apply_bc(rho: np.ndarray, u: np.ndarray, v: np.ndarray) -> None:
     rho[:, 0]  = rho[:, 1]
@@ -483,7 +483,7 @@ def plot_centerline_compare(x, num_no, num_aiv, exact, ylabel, out_png, xf):
 # ============================================================
 # Main
 # ============================================================
-if __name__ == "__main__":
+def main():
     t0 = time.perf_counter()
     rho_no, u_no, v_no, _, _ = run_sim(use_aiv=False)
     t1 = time.perf_counter()
@@ -532,3 +532,6 @@ if __name__ == "__main__":
     plt.close(fig)
 
     print(f"Saved outputs to: {OUTDIR.resolve()}")
+
+if __name__ == '__main__':
+    main()
